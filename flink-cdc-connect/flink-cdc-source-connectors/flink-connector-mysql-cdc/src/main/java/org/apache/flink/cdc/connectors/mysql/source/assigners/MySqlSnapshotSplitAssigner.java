@@ -25,6 +25,7 @@ import org.apache.flink.cdc.connectors.mysql.source.assigners.state.SnapshotPend
 import org.apache.flink.cdc.connectors.mysql.source.config.MySqlSourceConfig;
 import org.apache.flink.cdc.connectors.mysql.source.config.MySqlSourceOptions;
 import org.apache.flink.cdc.connectors.mysql.source.connection.JdbcConnectionPools;
+import org.apache.flink.cdc.connectors.mysql.source.metrics.SourceEnumeratorMetrics;
 import org.apache.flink.cdc.connectors.mysql.source.offset.BinlogOffset;
 import org.apache.flink.cdc.connectors.mysql.source.reader.MySqlSourceReader;
 import org.apache.flink.cdc.connectors.mysql.source.split.FinishedSnapshotSplitInfo;
@@ -99,6 +100,8 @@ public class MySqlSnapshotSplitAssigner implements MySqlSplitAssigner {
 
     private final MySqlPartition partition;
     private final Object lock = new Object();
+
+    private SourceEnumeratorMetrics enumeratorMetrics;
 
     private volatile Throwable uncaughtSplitterException;
     private AssignerStatus assignerStatus;
@@ -330,9 +333,11 @@ public class MySqlSnapshotSplitAssigner implements MySqlSplitAssigner {
                     tableSchemas.putAll(tableSchema);
                 }
 
+                List<String> splitIds = new ArrayList<>();
                 for (MySqlSnapshotSplit split : splits) {
                     MySqlSchemalessSnapshotSplit schemalessSnapshotSplit =
                             split.toSchemalessSnapshotSplit();
+                    splitIds.add(schemalessSnapshotSplit.splitId());
                     if (sourceConfig.isAssignUnboundedChunkFirst() && split.getSplitEnd() == null) {
                         // assign unbounded split first
                         remainingSplits.add(0, schemalessSnapshotSplit);
@@ -342,6 +347,9 @@ public class MySqlSnapshotSplitAssigner implements MySqlSplitAssigner {
                 }
 
                 chunkNum += splits.size();
+                if (enumeratorMetrics != null) {
+                    enumeratorMetrics.getTableMetrics(nextTable).addNewSplits(splitIds);
+                }
                 if (!chunkSplitter.hasNextChunk()) {
                     remainingTables.remove(nextTable);
                 }
@@ -368,6 +376,11 @@ public class MySqlSnapshotSplitAssigner implements MySqlSplitAssigner {
                 remainingSplits.remove(split);
                 assignedSplits.put(split.splitId(), split);
                 addAlreadyProcessedTablesIfNotExists(split.getTableId());
+                if (enumeratorMetrics != null) {
+                    enumeratorMetrics
+                            .getTableMetrics(split.getTableId())
+                            .finishProcessSplit(split.splitId());
+                }
                 return Optional.of(
                         split.toMySqlSnapshotSplit(tableSchemas.get(split.getTableId())));
             } else if (!remainingTables.isEmpty()) {
@@ -446,6 +459,14 @@ public class MySqlSnapshotSplitAssigner implements MySqlSplitAssigner {
             // because they are failed
             assignedSplits.remove(split.splitId());
             splitFinishedOffsets.remove(split.splitId());
+
+            if (enumeratorMetrics != null) {
+                enumeratorMetrics
+                        .getTableMetrics(split.asSnapshotSplit().getTableId())
+                        .reprocessSplit(split.splitId());
+                TableId tableId = split.asSnapshotSplit().getTableId();
+                enumeratorMetrics.getTableMetrics(tableId).removeFinishedSplit(split.splitId());
+            }
         }
     }
 
@@ -637,5 +658,50 @@ public class MySqlSnapshotSplitAssigner implements MySqlSplitAssigner {
         if (assignerStatus == AssignerStatus.INITIAL_ASSIGNING) {
             enumeratorContext.setIsProcessingBacklog(true);
         }
+    }
+
+    /**
+     * Initialize the SourceEnumeratorMetrics for this snapshot split assigner.
+     *
+     * @param enumeratorMetrics the metrics instance to use
+     */
+    public void initEnumeratorMetrics(SourceEnumeratorMetrics enumeratorMetrics) {
+        this.enumeratorMetrics = enumeratorMetrics;
+
+        this.enumeratorMetrics.enterSnapshotPhase();
+        this.enumeratorMetrics.registerMetrics(
+                () -> alreadyProcessedTables.size(),
+                () -> assignedSplits.size(),
+                () -> remainingSplits.size());
+        this.enumeratorMetrics.addNewTables(computeTablesPendingSnapshot());
+        for (MySqlSchemalessSnapshotSplit snapshotSplit : remainingSplits) {
+            this.enumeratorMetrics
+                    .getTableMetrics(snapshotSplit.getTableId())
+                    .addNewSplit(snapshotSplit.splitId());
+        }
+        for (MySqlSchemalessSnapshotSplit snapshotSplit : assignedSplits.values()) {
+            this.enumeratorMetrics
+                    .getTableMetrics(snapshotSplit.getTableId())
+                    .addProcessedSplit(snapshotSplit.splitId());
+        }
+        for (String splitId : splitFinishedOffsets.keySet()) {
+            TableId tableId = MySqlSnapshotSplit.extractTableId(splitId);
+            this.enumeratorMetrics.getTableMetrics(tableId).addFinishedSplit(splitId);
+        }
+    }
+
+    private int computeTablesPendingSnapshot() {
+        int numTablesPendingSnapshot = remainingTables.size();
+        Set<TableId> computedTables = new HashSet<>();
+        for (MySqlSchemalessSnapshotSplit split : remainingSplits) {
+            TableId tableId = split.getTableId();
+            if (!computedTables.contains(tableId)
+                    && !alreadyProcessedTables.contains(tableId)
+                    && !remainingTables.contains(tableId)) {
+                computedTables.add(tableId);
+                numTablesPendingSnapshot++;
+            }
+        }
+        return numTablesPendingSnapshot;
     }
 }

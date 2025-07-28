@@ -1,0 +1,374 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.cdc.connectors.mysql.source.metrics;
+
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.cdc.common.data.RecordData;
+import org.apache.flink.cdc.common.event.DataChangeEvent;
+import org.apache.flink.cdc.common.event.Event;
+import org.apache.flink.cdc.common.event.OperationType;
+import org.apache.flink.cdc.connectors.mysql.debezium.DebeziumUtils;
+import org.apache.flink.cdc.connectors.mysql.source.MySqlSource;
+import org.apache.flink.cdc.connectors.mysql.table.StartupOptions;
+import org.apache.flink.cdc.connectors.mysql.testutils.MySqlContainer;
+import org.apache.flink.cdc.connectors.mysql.testutils.MySqlVersion;
+import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
+import org.apache.flink.cdc.connectors.utils.ExternalResourceProxy;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.Gauge;
+import org.apache.flink.metrics.Metric;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.runtime.minicluster.RpcServiceSharing;
+import org.apache.flink.runtime.testutils.InMemoryReporter;
+import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.data.conversion.RowRowConverter;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.test.util.MiniClusterWithClientResource;
+import org.apache.flink.types.RowKind;
+import org.apache.flink.util.CloseableIterator;
+
+import io.debezium.connector.mysql.MySqlConnection;
+import io.debezium.jdbc.JdbcConnection;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testcontainers.containers.output.Slf4jLogConsumer;
+import org.testcontainers.lifecycle.Startables;
+
+import java.sql.SQLException;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** MySQL Source Metrics Tests. */
+public class MySqlSourceMetricsTest {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MySqlSourceMetricsTest.class);
+
+    private static final int DEFAULT_PARALLELISM = 4;
+    private static final MySqlContainer MYSQL_CONTAINER = createMySqlContainer(MySqlVersion.V8_0);
+    protected InMemoryReporter metricReporter = InMemoryReporter.createWithRetainedMetrics();
+
+    @RegisterExtension
+    public final ExternalResourceProxy<MiniClusterWithClientResource> miniClusterResource =
+            new ExternalResourceProxy<>(
+                    new MiniClusterWithClientResource(
+                            new MiniClusterResourceConfiguration.Builder()
+                                    .setNumberTaskManagers(1)
+                                    .setNumberSlotsPerTaskManager(DEFAULT_PARALLELISM)
+                                    .setRpcServiceSharing(RpcServiceSharing.DEDICATED)
+                                    .withHaLeadershipControl()
+                                    .setConfiguration(
+                                            metricReporter.addToConfiguration(new Configuration()))
+                                    .build()));
+
+    @BeforeAll
+    public static void startContainers() {
+        LOG.info("Starting containers...");
+        Startables.deepStart(Stream.of(MYSQL_CONTAINER)).join();
+        LOG.info("Containers are started.");
+    }
+
+    private final UniqueDatabase inventoryDatabase =
+            new UniqueDatabase(MYSQL_CONTAINER, "metrics", "mysqluser", "mysqlpw");
+
+    @Test
+    public void testSourceMetrics() throws Exception {
+        final DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD("id", DataTypes.BIGINT()),
+                        DataTypes.FIELD("name", DataTypes.STRING()),
+                        DataTypes.FIELD("age", DataTypes.INT()));
+
+        inventoryDatabase.createAndInitialize();
+        final String tableId = inventoryDatabase.getDatabaseName() + ".users";
+        MySqlSource<Event> mySqlChangeEventSource =
+                MySqlSource.<Event>builder()
+                        .hostname(MYSQL_CONTAINER.getHost())
+                        .port(MYSQL_CONTAINER.getDatabasePort())
+                        .databaseList(inventoryDatabase.getDatabaseName())
+                        .tableList(tableId)
+                        .username(inventoryDatabase.getUsername())
+                        .password(inventoryDatabase.getPassword())
+                        .serverId("5401-5404")
+                        .serverTimeZone("UTC")
+                        .deserializer(new MySqlEventDeserializer())
+                        .includeSchemaChanges(true) // output the schema changes as well
+                        .splitSize(2)
+                        .startupOptions(StartupOptions.initial())
+                        .build();
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // enable checkpoint
+        env.enableCheckpointing(3000);
+        // set the source parallelism to 4
+        CloseableIterator<Event> iterator =
+                env.fromSource(
+                                mySqlChangeEventSource,
+                                WatermarkStrategy.noWatermarks(),
+                                "MySqlParallelSource")
+                        .setParallelism(1)
+                        .executeAndCollect(); // collect record
+        String[] snapshotExpectedRecords =
+                new String[] {
+                    "+I[101, Tom, 3]",
+                    "+I[102, Jack, 5]",
+                    "+I[103, Allen, 10]",
+                    "+I[104, Andrew, 13]",
+                    "+I[105, Arnold, 15]",
+                    "+I[106, Claud, 19]",
+                    "+I[107, Howard, 37]",
+                    "+I[108, Jacob, 46]",
+                    "+I[109, Lionel, 58]"
+                };
+
+        // step-1: consume snapshot data
+        List<Event> snapshotRowDataList = new ArrayList<>();
+        for (int i = 0; i < snapshotExpectedRecords.length && iterator.hasNext(); i++) {
+            snapshotRowDataList.add(iterator.next());
+        }
+
+        List<String> snapshotActualRecords = formatResult(snapshotRowDataList, dataType);
+        assertEqualsInAnyOrder(Arrays.asList(snapshotExpectedRecords), snapshotActualRecords);
+
+        // step-2: make 6 change events in one MySQL transaction
+        makeBinlogEvents(getConnection(), tableId);
+        // mock ddl events
+        makeDdlEvents(getConnection(), tableId);
+
+        String[] binlogExpectedRecords =
+                new String[] {
+                    "-U[103, Allen, 10]",
+                    "+U[103, Oswald, 10]",
+                    "+I[110, Terence, 78]",
+                    "-D[110, Terence, 78]",
+                    "-U[103, Oswald, 10]",
+                    "+U[103, Marry, 10]"
+                };
+
+        // step-3: consume binlog change events
+        List<Event> binlogRowDataList = new ArrayList<>();
+        for (int i = 0; i < 4 && iterator.hasNext(); i++) {
+            binlogRowDataList.add(iterator.next());
+        }
+        List<String> binlogActualRecords = formatResult(binlogRowDataList, dataType);
+        assertEqualsInAnyOrder(Arrays.asList(binlogExpectedRecords), binlogActualRecords);
+
+        Set<MetricGroup> metricGroups = metricReporter.findGroups("users");
+        for (MetricGroup enumeratorGroup : metricGroups) {
+            boolean isTableMetric = true;
+            for (String scopeComponent : enumeratorGroup.getScopeComponents()) {
+                if (scopeComponent.contains("enumerator")) {
+                    isTableMetric = false;
+                    break;
+                }
+            }
+            if (!isTableMetric) {
+                break;
+            }
+            Map<String, Metric> enumeratorMetrics =
+                    metricReporter.getMetricsByGroup(enumeratorGroup);
+            assertThat(((Counter) enumeratorMetrics.get("numDeleteDMLRecords")).getCount())
+                    .isEqualTo(1);
+            assertThat(((Counter) enumeratorMetrics.get("numInsertDMLRecords")).getCount())
+                    .isEqualTo(1);
+            assertThat(((Counter) enumeratorMetrics.get("numSnapshotRecords")).getCount())
+                    .isEqualTo(9);
+            // ddl eventd
+            assertThat(((Counter) enumeratorMetrics.get("numDDLRecords")).getCount()).isEqualTo(1);
+            assertThat(((Counter) enumeratorMetrics.get("numRecordsIn")).getCount()).isEqualTo(13);
+            assertThat(((Counter) enumeratorMetrics.get("numUpdateDMLRecords")).getCount())
+                    .isEqualTo(2);
+        }
+        Set<MetricGroup> enumeratorGroups = metricReporter.findGroups("enumerator");
+        for (MetricGroup enumeratorGroup : enumeratorGroups) {
+            boolean isTableMetric = false;
+            for (String scopeComponent : enumeratorGroup.getScopeComponents()) {
+                if (scopeComponent.contains("users")) {
+                    isTableMetric = true;
+                    break;
+                }
+            }
+            if (isTableMetric) {
+                continue;
+            }
+            Map<String, Metric> enumeratorMetrics =
+                    metricReporter.getMetricsByGroup(enumeratorGroup);
+            assertThat(
+                            ((Gauge<Integer>) enumeratorMetrics.get("numSnapshotSplitsRemaining"))
+                                    .getValue()
+                                    .intValue())
+                    .isEqualTo(5);
+            assertThat(
+                            ((Gauge<Integer>) enumeratorMetrics.get("numSnapshotSplitsProcessed"))
+                                    .getValue()
+                                    .intValue())
+                    .isEqualTo(4);
+            assertThat(
+                            ((Gauge<Integer>) enumeratorMetrics.get("numSnapshotSplitsFinished"))
+                                    .getValue()
+                                    .intValue())
+                    .isEqualTo(4);
+            assertThat(((Gauge<Long>) enumeratorMetrics.get("snapshotEndTime")).getValue())
+                    .isGreaterThan(0);
+            assertThat(((Gauge<Long>) enumeratorMetrics.get("snapshotStartTime")).getValue())
+                    .isGreaterThan(0);
+            assertThat(((Gauge<Boolean>) enumeratorMetrics.get("isSnapshotting")).getValue())
+                    .isFalse();
+            assertThat(((Gauge<Boolean>) enumeratorMetrics.get("isStreamReading")).getValue())
+                    .isTrue();
+            assertThat(
+                            ((Gauge<Integer>) enumeratorMetrics.get("numTablesSnapshotted"))
+                                    .getValue()
+                                    .intValue())
+                    .isEqualTo(1);
+        }
+        iterator.close();
+    }
+
+    private List<String> formatResult(List<Event> records, DataType dataType) {
+        final RowRowConverter converter = RowRowConverter.create(dataType);
+        return records.stream()
+                .filter(event -> event instanceof DataChangeEvent)
+                .map(
+                        event -> {
+                            DataChangeEvent dataChangeEvent = (DataChangeEvent) event;
+                            RecordData after = dataChangeEvent.after();
+                            RecordData before = dataChangeEvent.before();
+                            RowKind rowKind = convertOperationTypeToRowKind(dataChangeEvent.op());
+                            if (RowKind.UPDATE_BEFORE.equals(rowKind)) {
+                                return rowKind.shortString() + "[" + before.toString() + "]";
+                            } else if (RowKind.UPDATE_AFTER.equals(rowKind)) {
+                                return rowKind.shortString() + "[" + after.toString() + "]";
+                            } else if (RowKind.DELETE.equals(rowKind)) {
+                                return rowKind.shortString() + "[" + before.toString() + "]";
+                            } else {
+                                return rowKind.shortString() + "[" + after.toString() + "]";
+                            }
+                        })
+                .collect(Collectors.toList());
+    }
+
+    private MySqlConnection getConnection() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("database.hostname", MYSQL_CONTAINER.getHost());
+        properties.put("database.port", MYSQL_CONTAINER.getDatabasePort());
+        properties.put("database.user", inventoryDatabase.getUsername());
+        properties.put("database.password", inventoryDatabase.getPassword());
+        properties.put("database.serverTimezone", ZoneId.of("UTC").toString());
+        io.debezium.config.Configuration configuration =
+                io.debezium.config.Configuration.from(properties);
+        return DebeziumUtils.createMySqlConnection(configuration, new Properties());
+    }
+
+    private void makeBinlogEvents(JdbcConnection connection, String tableId) throws SQLException {
+        try {
+            connection.setAutoCommit(false);
+
+            // make binlog events
+            connection.execute(
+                    "UPDATE " + tableId + " SET name = 'Oswald' where id = 103",
+                    "INSERT INTO " + tableId + " VALUES(110,'Terence',78)",
+                    "DELETE FROM " + tableId + " where id = 110",
+                    "UPDATE " + tableId + " SET name = 'Marry' where id = 103");
+            connection.commit();
+        } finally {
+            connection.close();
+        }
+    }
+
+    private void makeDdlEvents(JdbcConnection connection, String tableId) throws SQLException {
+        try {
+            connection.setAutoCommit(false);
+            // make binlog events
+            connection.execute("alter table " + tableId + " add test_add_col int null");
+            connection.commit();
+        } finally {
+            connection.close();
+        }
+    }
+
+    private RowKind convertOperationTypeToRowKind(OperationType operationType) {
+        switch (operationType) {
+            case INSERT:
+                return RowKind.INSERT;
+            case UPDATE:
+                return RowKind.UPDATE_AFTER;
+            case DELETE:
+                return RowKind.DELETE;
+            default:
+                throw new IllegalArgumentException("Unsupported operation type: " + operationType);
+        }
+    }
+
+    public static void assertEqualsInAnyOrder(List<String> expected, List<String> actual) {
+        assertThat(expected).isNotNull();
+        assertThat(actual).isNotNull();
+        assertThat(actual).hasSameSizeAs(expected);
+        assertThat(actual).containsExactlyInAnyOrderElementsOf(expected);
+    }
+
+    public static void assertEqualsInOrder(List<String> expected, List<String> actual) {
+        assertThat(expected).isNotNull();
+        assertThat(actual).isNotNull();
+        assertThat(actual).hasSameSizeAs(expected);
+        assertThat(actual).containsExactlyElementsOf(expected);
+    }
+
+    private static MySqlContainer createMySqlContainer(MySqlVersion version) {
+        return (MySqlContainer)
+                new MySqlContainer(version)
+                        .withConfigurationOverride("docker/server-gtids/my.cnf")
+                        .withSetupSQL("docker/setup.sql")
+                        .withDatabaseName("flink-test")
+                        .withUsername("flinkuser")
+                        .withPassword("flinkpw")
+                        .withLogConsumer(new Slf4jLogConsumer(LOG));
+    }
+
+    private static class MySqlEventDeserializer
+            implements org.apache.flink.cdc.debezium.DebeziumDeserializationSchema<Event> {
+        @Override
+        public void deserialize(
+                org.apache.kafka.connect.source.SourceRecord record,
+                org.apache.flink.util.Collector<Event> out)
+                throws Exception {
+            // Implementation would go here
+        }
+
+        @Override
+        public org.apache.flink.api.common.typeinfo.TypeInformation<Event> getProducedType() {
+            return org.apache.flink.api.common.typeinfo.TypeInformation.of(Event.class);
+        }
+    }
+}

@@ -227,7 +227,7 @@ public class MySqlSource<T>
                         "Failed to discover captured tables for enumerator", e);
             }
         } else {
-            splitAssigner = new MySqlBinlogSplitAssigner(sourceConfig);
+            splitAssigner = new MySqlBinlogSplitAssigner(sourceConfig, enumContext);
         }
 
         return new MySqlSourceEnumerator(
@@ -258,7 +258,7 @@ public class MySqlSource<T>
         } else if (checkpoint instanceof BinlogPendingSplitsState) {
             splitAssigner =
                     new MySqlBinlogSplitAssigner(
-                            sourceConfig, (BinlogPendingSplitsState) checkpoint);
+                            sourceConfig, (BinlogPendingSplitsState) checkpoint, enumContext);
         } else {
             throw new UnsupportedOperationException(
                     "Unsupported restored PendingSplitsState: " + checkpoint);

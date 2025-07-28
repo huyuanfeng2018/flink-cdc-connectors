@@ -1249,7 +1249,8 @@ class BinlogSplitReaderTest extends MySqlSourceTestBase {
     }
 
     private MySqlBinlogSplit createBinlogSplit(MySqlSourceConfig sourceConfig) throws Exception {
-        MySqlBinlogSplitAssigner binlogSplitAssigner = new MySqlBinlogSplitAssigner(sourceConfig);
+        MySqlBinlogSplitAssigner binlogSplitAssigner =
+                new MySqlBinlogSplitAssigner(sourceConfig, getMySqlSplitEnumeratorContext());
         binlogSplitAssigner.open();
         try (MySqlConnection jdbc = DebeziumUtils.createMySqlConnection(sourceConfig)) {
             Map<TableId, TableChanges.TableChange> tableSchemas =

@@ -17,14 +17,18 @@
 
 package org.apache.flink.cdc.connectors.mysql.source.assigners;
 
+import org.apache.flink.api.connector.source.SourceSplit;
+import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.cdc.connectors.mysql.source.assigners.state.BinlogPendingSplitsState;
 import org.apache.flink.cdc.connectors.mysql.source.assigners.state.PendingSplitsState;
 import org.apache.flink.cdc.connectors.mysql.source.config.MySqlSourceConfig;
 import org.apache.flink.cdc.connectors.mysql.source.connection.JdbcConnectionPools;
+import org.apache.flink.cdc.connectors.mysql.source.metrics.SourceEnumeratorMetrics;
 import org.apache.flink.cdc.connectors.mysql.source.offset.BinlogOffset;
 import org.apache.flink.cdc.connectors.mysql.source.split.FinishedSnapshotSplitInfo;
 import org.apache.flink.cdc.connectors.mysql.source.split.MySqlBinlogSplit;
 import org.apache.flink.cdc.connectors.mysql.source.split.MySqlSplit;
+import org.apache.flink.util.CollectionUtil;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -35,7 +39,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-/** A {@link MySqlSplitAssigner} which only read binlog from current binlog position. */
+/**
+ * A {@link MySqlSplitAssigner} which only read binlog from current binlog position.
+ */
 public class MySqlBinlogSplitAssigner implements MySqlSplitAssigner {
 
     public static final String BINLOG_SPLIT_ID = "binlog-split";
@@ -43,24 +49,36 @@ public class MySqlBinlogSplitAssigner implements MySqlSplitAssigner {
     private final MySqlSourceConfig sourceConfig;
 
     private boolean isBinlogSplitAssigned;
+    private final SplitEnumeratorContext<? extends SourceSplit> enumeratorContext;
+    private SourceEnumeratorMetrics enumeratorMetrics;
 
-    public MySqlBinlogSplitAssigner(MySqlSourceConfig sourceConfig) {
-        this(sourceConfig, false);
+    public MySqlBinlogSplitAssigner(MySqlSourceConfig sourceConfig, SplitEnumeratorContext<? extends SourceSplit> enumeratorContext) {
+        this(sourceConfig, false, enumeratorContext);
     }
 
     public MySqlBinlogSplitAssigner(
-            MySqlSourceConfig sourceConfig, BinlogPendingSplitsState checkpoint) {
-        this(sourceConfig, checkpoint.isBinlogSplitAssigned());
+        MySqlSourceConfig sourceConfig, BinlogPendingSplitsState checkpoint,
+        SplitEnumeratorContext<? extends SourceSplit> enumeratorContext) {
+        this(sourceConfig, checkpoint.isBinlogSplitAssigned(), enumeratorContext);
     }
 
     private MySqlBinlogSplitAssigner(
-            MySqlSourceConfig sourceConfig, boolean isBinlogSplitAssigned) {
+        MySqlSourceConfig sourceConfig, boolean isBinlogSplitAssigned,
+        SplitEnumeratorContext<? extends SourceSplit> enumeratorContext) {
         this.sourceConfig = sourceConfig;
         this.isBinlogSplitAssigned = isBinlogSplitAssigned;
+        this.enumeratorContext = enumeratorContext;
     }
 
     @Override
-    public void open() {}
+    public void open() {
+        this.enumeratorMetrics = new SourceEnumeratorMetrics(enumeratorContext.metricGroup());
+        if (isBinlogSplitAssigned) {
+            enumeratorMetrics.enterStreamReading();
+        } else {
+            enumeratorMetrics.exitStreamReading();
+        }
+    }
 
     @Override
     public Optional<MySqlSplit> getNext() {
@@ -68,6 +86,7 @@ public class MySqlBinlogSplitAssigner implements MySqlSplitAssigner {
             return Optional.empty();
         } else {
             isBinlogSplitAssigned = true;
+            enumeratorMetrics.enterStreamReading();
             return Optional.of(createBinlogSplit());
         }
     }
@@ -89,8 +108,11 @@ public class MySqlBinlogSplitAssigner implements MySqlSplitAssigner {
 
     @Override
     public void addSplits(Collection<MySqlSplit> splits) {
-        // we don't store the split, but will re-create binlog split later
-        isBinlogSplitAssigned = false;
+        if (!CollectionUtil.isNullOrEmpty(splits)) {
+            // we don't store the split, but will re-create binlog split later
+            isBinlogSplitAssigned = false;
+            enumeratorMetrics.exitStreamReading();
+        }
     }
 
     @Override
@@ -129,11 +151,11 @@ public class MySqlBinlogSplitAssigner implements MySqlSplitAssigner {
 
     private MySqlBinlogSplit createBinlogSplit() {
         return new MySqlBinlogSplit(
-                BINLOG_SPLIT_ID,
-                sourceConfig.getStartupOptions().binlogOffset,
-                BinlogOffset.ofNonStopping(),
-                new ArrayList<>(),
-                new HashMap<>(),
-                0);
+            BINLOG_SPLIT_ID,
+            sourceConfig.getStartupOptions().binlogOffset,
+            BinlogOffset.ofNonStopping(),
+            new ArrayList<>(),
+            new HashMap<>(),
+            0);
     }
 }

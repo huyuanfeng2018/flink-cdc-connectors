@@ -65,4 +65,20 @@ public class MySqlSchemalessSnapshotSplit extends MySqlSnapshotSplit {
                 getHighWatermark(),
                 tableSchemas);
     }
+
+    /**
+     * Extracts the chunk ID from the given split ID. This method delegates to the parent class
+     * implementation.
+     */
+    public static int extractChunkId(String splitId) {
+        return MySqlSnapshotSplit.extractChunkId(splitId);
+    }
+
+    /**
+     * Extracts the table ID from the given split ID. This method delegates to the parent class
+     * implementation.
+     */
+    public static TableId extractTableId(String splitId) {
+        return MySqlSnapshotSplit.extractTableId(splitId);
+    }
 }

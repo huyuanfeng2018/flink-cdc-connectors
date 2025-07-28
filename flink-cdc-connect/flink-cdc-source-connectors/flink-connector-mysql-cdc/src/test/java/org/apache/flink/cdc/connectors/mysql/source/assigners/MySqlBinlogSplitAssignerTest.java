@@ -31,6 +31,8 @@ import java.io.IOException;
 import java.time.ZoneId;
 import java.util.Optional;
 
+import static org.apache.flink.cdc.connectors.mysql.testutils.MetricsUtils.getMySqlSplitEnumeratorContext;
+
 /**
  * Unit test for {@link
  * org.apache.flink.cdc.connectors.mysql.source.assigners.MySqlBinlogSplitAssigner}.
@@ -69,7 +71,9 @@ class MySqlBinlogSplitAssignerTest {
     private void checkAssignedBinlogOffset(
             StartupOptions startupOptions, BinlogOffset expectedOffset) throws IOException {
         // Set starting from the given option
-        MySqlBinlogSplitAssigner assigner = new MySqlBinlogSplitAssigner(getConfig(startupOptions));
+        MySqlBinlogSplitAssigner assigner =
+                new MySqlBinlogSplitAssigner(
+                        getConfig(startupOptions), getMySqlSplitEnumeratorContext());
         // Get splits from assigner
         Optional<MySqlSplit> optionalSplit = assigner.getNext();
         Assertions.assertThat(optionalSplit).isPresent();

@@ -604,7 +604,8 @@ class MySqlSourceReaderTest extends MySqlSourceTestBase {
     }
 
     private MySqlSplit createBinlogSplit(MySqlSourceConfig sourceConfig) {
-        MySqlBinlogSplitAssigner binlogSplitAssigner = new MySqlBinlogSplitAssigner(sourceConfig);
+        MySqlBinlogSplitAssigner binlogSplitAssigner =
+                new MySqlBinlogSplitAssigner(sourceConfig, getMySqlSplitEnumeratorContext());
         binlogSplitAssigner.open();
         return binlogSplitAssigner.getNext().get();
     }
