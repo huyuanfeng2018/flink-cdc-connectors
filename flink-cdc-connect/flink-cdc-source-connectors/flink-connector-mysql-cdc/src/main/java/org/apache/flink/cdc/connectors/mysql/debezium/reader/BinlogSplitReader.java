@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -278,10 +279,22 @@ public class BinlogSplitReader implements DebeziumReader<SourceRecords, MySqlSpl
                                 statefulTaskContext.getSourceConfig().getChunkKeyColumns(),
                                 statefulTaskContext.getSourceConfig().isTreatTinyInt1AsBoolean());
 
+                String splitKeyName = splitKeyType.getFieldNames().get(0);
+                io.debezium.relational.Table table =
+                        statefulTaskContext.getDatabaseSchema().tableFor(tableId);
+                io.debezium.relational.Column splitColumn =
+                        table != null ? table.columnWithName(splitKeyName) : null;
+                ZoneId serverTimeZone =
+                        ZoneId.of(statefulTaskContext.getSourceConfig().getServerTimeZone());
+
                 Struct target = RecordUtils.getStructContainsChunkKey(sourceRecord);
                 Object[] chunkKey =
                         RecordUtils.getSplitKey(
-                                splitKeyType, statefulTaskContext.getSchemaNameAdjuster(), target);
+                                splitKeyType,
+                                statefulTaskContext.getSchemaNameAdjuster(),
+                                target,
+                                splitColumn,
+                                serverTimeZone);
                 for (FinishedSnapshotSplitInfo splitInfo : finishedSplitsInfo.get(tableId)) {
                     if (RecordUtils.splitKeyRangeContains(
                                     chunkKey, splitInfo.getSplitStart(), splitInfo.getSplitEnd())

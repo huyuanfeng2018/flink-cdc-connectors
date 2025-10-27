@@ -17,6 +17,7 @@
 
 package org.apache.flink.cdc.connectors.mysql.source.utils;
 
+import org.apache.flink.cdc.common.annotation.VisibleForTesting;
 import org.apache.flink.cdc.common.utils.StringUtils;
 import org.apache.flink.cdc.connectors.mysql.debezium.dispatcher.SignalEventDispatcher.WatermarkKind;
 import org.apache.flink.cdc.connectors.mysql.debezium.reader.DebeziumReader;
@@ -31,6 +32,7 @@ import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMap
 import io.debezium.data.Envelope;
 import io.debezium.document.Document;
 import io.debezium.document.DocumentReader;
+import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 import io.debezium.relational.history.HistoryRecord;
 import io.debezium.util.SchemaNameAdjuster;
@@ -40,12 +42,16 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -106,13 +112,20 @@ public class RecordUtils {
             RowType splitBoundaryType,
             SchemaNameAdjuster nameAdjuster,
             Object[] splitStart,
-            Object[] splitEnd) {
+            Object[] splitEnd,
+            Column splitColumn,
+            ZoneId serverTimeZone) {
         if (isDataChangeRecord(binlogRecord)) {
             Struct value = (Struct) binlogRecord.value();
             if (value != null) {
                 Struct chunkKeyStruct = getStructContainsChunkKey(binlogRecord);
                 if (splitKeyRangeContains(
-                        getSplitKey(splitBoundaryType, nameAdjuster, chunkKeyStruct),
+                        getSplitKey(
+                                splitBoundaryType,
+                                nameAdjuster,
+                                chunkKeyStruct,
+                                splitColumn,
+                                serverTimeZone),
                         splitStart,
                         splitEnd)) {
                     boolean hasPrimaryKey = binlogRecord.key() != null;
@@ -141,7 +154,11 @@ public class RecordUtils {
                                         true);
                                 if (!splitKeyRangeContains(
                                         getSplitKey(
-                                                splitBoundaryType, nameAdjuster, structFromAfter),
+                                                splitBoundaryType,
+                                                nameAdjuster,
+                                                structFromAfter,
+                                                splitColumn,
+                                                serverTimeZone),
                                         splitStart,
                                         splitEnd)) {
                                     LOG.warn(
@@ -432,10 +449,121 @@ public class RecordUtils {
     }
 
     public static Object[] getSplitKey(
-            RowType splitBoundaryType, SchemaNameAdjuster nameAdjuster, Struct target) {
-        // the split key field contains single field now
+            RowType splitBoundaryType,
+            SchemaNameAdjuster nameAdjuster,
+            Struct target,
+            Column splitColumn,
+            ZoneId serverTimeZone) {
         String splitFieldName = nameAdjuster.adjust(splitBoundaryType.getFieldNames().get(0));
-        return new Object[] {target.get(splitFieldName)};
+        Object value = target.get(splitFieldName);
+
+        if (value instanceof Long && isTemporalColumn(splitColumn)) {
+            int precision = splitColumn.length();
+            boolean isTimestamp = isTimestampType(splitColumn);
+            value =
+                    convertTimestampToLocalDateTime(
+                            (Long) value, precision, isTimestamp, serverTimeZone);
+        }
+
+        return new Object[] {value};
+    }
+
+    /**
+     * Gets split column information.
+     *
+     * @param tableSchemas table schemas
+     * @param tableId table ID
+     * @param splitKeyName split key column name
+     * @return Column object, or null if not found
+     */
+    @Nullable
+    public static Column getSplitColumn(
+            Map<TableId, io.debezium.relational.history.TableChanges.TableChange> tableSchemas,
+            TableId tableId,
+            String splitKeyName) {
+        io.debezium.relational.history.TableChanges.TableChange tableChange =
+                tableSchemas.get(tableId);
+        if (tableChange == null) {
+            return null;
+        }
+        io.debezium.relational.Table table = tableChange.getTable();
+        return table.columnWithName(splitKeyName);
+    }
+
+    private static boolean isTemporalColumn(Column column) {
+        if (column == null) {
+            return false;
+        }
+        int jdbcType = column.jdbcType();
+        if (jdbcType != java.sql.Types.TIMESTAMP) {
+            return false;
+        }
+        // Further check the type name
+        String typeName = column.typeName();
+        if (typeName == null) {
+            return false;
+        }
+        String upperCaseTypeName = typeName.toUpperCase();
+        return upperCaseTypeName.startsWith("DATETIME")
+                || upperCaseTypeName.startsWith("TIMESTAMP");
+    }
+
+    /**
+     * Checks if the column is TIMESTAMP type (not DATETIME).
+     *
+     * @param column column information
+     * @return true if it's a TIMESTAMP type
+     */
+    private static boolean isTimestampType(Column column) {
+        if (column == null) {
+            return false;
+        }
+        String typeName = column.typeName();
+        if (typeName == null) {
+            return false;
+        }
+        return typeName.toUpperCase().startsWith("TIMESTAMP");
+    }
+
+    /**
+     * Converts a Long timestamp from binlog to LocalDateTime.
+     *
+     * <p>Reverses Debezium's conversion logic:
+     *
+     * <pre>
+     * Timezone handling:
+     * - DATETIME (no timezone): Debezium uses UTC, we also use UTC for reverse conversion
+     * - TIMESTAMP (with timezone): Debezium uses server timezone, we also use server timezone
+     *
+     * Precision handling:
+     * - precision <= 3: millisecond timestamp, using Instant.ofEpochMilli()
+     * - precision > 3:  microsecond timestamp, using Instant.ofEpochSecond() + nanosecond adjustment
+     * </pre>
+     *
+     * @param timestamp timestamp from binlog (milliseconds or microseconds)
+     * @param precision field precision (e.g., DATETIME(6) has precision 6)
+     * @param isTimestamp whether it's TIMESTAMP type (true) or DATETIME type (false)
+     * @param serverTimeZone MySQL server timezone
+     * @return LocalDateTime
+     */
+    @VisibleForTesting
+    public static LocalDateTime convertTimestampToLocalDateTime(
+            Long timestamp, int precision, boolean isTimestamp, ZoneId serverTimeZone) {
+        if (timestamp == null) {
+            return null;
+        }
+
+        ZoneId zoneId = isTimestamp ? serverTimeZone : java.time.ZoneOffset.UTC;
+
+        if (precision > 3) {
+            long epochSecond = timestamp / 1_000_000L;
+            long nanoAdjustment = (timestamp % 1_000_000L) * 1_000L;
+            return Instant.ofEpochSecond(epochSecond, nanoAdjustment)
+                    .atZone(zoneId)
+                    .toLocalDateTime();
+        } else {
+            return Instant.ofEpochMilli(timestamp).atZone(zoneId).toLocalDateTime();
+        }
     }
 
     public static BinlogOffset getBinlogPosition(SourceRecord dataRecord) {

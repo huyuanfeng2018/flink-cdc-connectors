@@ -52,6 +52,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -354,13 +355,24 @@ public class SnapshotSplitReader implements DebeziumReader<SourceRecords, MySqlS
                         records.add(record);
                     }
                 } else {
+                    // 获取 split column 信息
+                    String splitKeyName =
+                            currentSnapshotSplit.getSplitKeyType().getFieldNames().get(0);
+                    io.debezium.relational.Column splitColumn =
+                            RecordUtils.getSplitColumn(
+                                    currentSnapshotSplit.getTableSchemas(),
+                                    currentSnapshotSplit.getTableId(),
+                                    splitKeyName);
+
                     RecordUtils.upsertBinlog(
                             snapshotRecords,
                             record,
                             currentSnapshotSplit.getSplitKeyType(),
                             nameAdjuster,
                             currentSnapshotSplit.getSplitStart(),
-                            currentSnapshotSplit.getSplitEnd());
+                            currentSnapshotSplit.getSplitEnd(),
+                            splitColumn,
+                            ZoneId.of(statefulTaskContext.getSourceConfig().getServerTimeZone()));
                 }
             }
         }
